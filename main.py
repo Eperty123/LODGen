@@ -1,6 +1,7 @@
 import bpy
 import re
 from bpy.props import (
+    BoolProperty,
     FloatProperty,
     IntProperty,
     CollectionProperty,
@@ -38,6 +39,11 @@ class LODGenProperties(PropertyGroup):
         description="Number of LODs to generate",
         default=6,
         min=1
+    )
+    preserve_shape_keys: BoolProperty(
+        name="Preverse Shape Keys",
+        description="Preserve shape keys for all LOD levells",
+        default=True
     )
 
 # -------------------
@@ -95,59 +101,76 @@ class LODGEN_OT_GenerateLODs(Operator):
         props = context.scene.lodgen_props
         step_scale = props.decimation_scale
         iterations = props.iterations
+        preserve_shape_keys = props.preserve_shape_keys
+        
+        #depsgraph = context.evaluated_depsgraph_get()
 
         for entry in props.objects:
             original_obj = entry.object_ref
+
             if not original_obj or original_obj.type != 'MESH':
-                self.report({'WARNING'}, f"Object {getattr(original_obj, 'name', 'Unknown')} not found or not a mesh, skipping.")
+                self.report({'WARNING'}, f"Skipping invalid object: {getattr(original_obj, 'name', 'Unknown')}.")
                 continue
 
             base_name = re.sub(r"\.\d+$", "", original_obj.name)
             lod_collection_name = f"{base_name}"
 
-            # Get or create LOD collection
+            # Create / get collection
             if lod_collection_name in bpy.data.collections:
                 target_collection = bpy.data.collections[lod_collection_name]
-                # Remove old LODs but leave the original
                 for o in list(target_collection.objects):
-                    if o != original_obj:
-                        bpy.data.objects.remove(o, do_unlink=True)
+                    bpy.data.objects.remove(o, do_unlink=True)
             else:
                 target_collection = bpy.data.collections.new(lod_collection_name)
                 context.scene.collection.children.link(target_collection)
 
-            # Hide the original but do not move it
+            # Hide original
             original_obj.hide_set(True)
             original_obj.hide_render = True
 
-            # Create LOD0 mesh from object with all modifiers applied
-            lod0_mesh = bpy.data.meshes.new_from_object(original_obj.evaluated_get(context.evaluated_depsgraph_get()))
-            lod0_obj = bpy.data.objects.new(f"{base_name}_LOD0", lod0_mesh)
-            target_collection.objects.link(lod0_obj)
+            # -------------------------
+            # LOD generation loop
+            # -------------------------
+            for lod_level in range(iterations):
 
-            current_obj = lod0_obj
-            current_ratio = step_scale
+                ratio = step_scale ** lod_level
 
-            # Create further LODs progressively
-            for lod_level in range(1, iterations):
-                # Make decimated copy from current_obj
-                temp_obj = current_obj.copy()
-                temp_mesh = current_obj.data.copy()
-                temp_obj.data = temp_mesh
-                bpy.context.scene.collection.objects.link(temp_obj)
+                # Always duplicate FROM ORIGINAL
+                lod_obj = original_obj.copy()
+                lod_obj.data = original_obj.data.copy()
 
-                dec_mod = temp_obj.modifiers.new(name="LODGen_Decimate", type='DECIMATE')
-                dec_mod.ratio = current_ratio
+                lod_obj.name = f"{base_name}_LOD{lod_level}"
+                target_collection.objects.link(lod_obj)
 
-                # Generate mesh with decimation applied
-                dec_mesh = bpy.data.meshes.new_from_object(temp_obj.evaluated_get(context.evaluated_depsgraph_get()))
-                bpy.data.objects.remove(temp_obj, do_unlink=True)
+                # Decide if this LOD should keep shape keys
+                #keep_shapes = lod_level <= 1  # LOD0 + LOD1 only
 
-                new_obj = bpy.data.objects.new(f"{base_name}_LOD{lod_level}", dec_mesh)
-                target_collection.objects.link(new_obj)
+                if not preserve_shape_keys:
+                    # Strip shape keys safely BEFORE decimation
+                    if lod_obj.data.shape_keys:
+                        lod_obj.shape_key_clear()
 
-                current_obj = new_obj
-                current_ratio *= step_scale
+                # Add decimate modifier
+                dec_mod = lod_obj.modifiers.new(
+                    name="LODGen_Decimate",
+                    type='DECIMATE'
+                )
+
+                dec_mod.ratio = ratio
+                dec_mod.use_collapse_triangulate = False
+
+                # Apply modifier (safe mode)
+                bpy.ops.object.select_all(action='DESELECT')
+                lod_obj.select_set(True)
+                context.view_layer.objects.active = lod_obj
+
+                if context.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+                try:
+                    bpy.ops.object.modifier_apply(modifier=dec_mod.name)
+                except RuntimeError as e:
+                    self.report({'WARNING'}, f"{lod_obj.name} failed: {e}")
 
         self.report({'INFO'}, "LOD generation complete.")
         return {'FINISHED'}
@@ -176,6 +199,7 @@ class LODGEN_PT_MainPanel(Panel):
 
         layout.prop(props, "decimation_scale")
         layout.prop(props, "iterations")
+        layout.prop(props, "preserve_shape_keys")
         layout.operator("lodgen.generate_lods", icon='MOD_DECIM')
 
 # -------------------
